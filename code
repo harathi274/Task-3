@@ -1,0 +1,234 @@
+import os
+import sys
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+# Optional imports (used if available)
+try:
+    import seaborn as sns
+    sns.set()
+    HAS_SEABORN = True
+except Exception:
+    HAS_SEABORN = False
+
+try:
+    from sklearn.linear_model import LinearRegression
+    from sklearn.metrics import r2_score
+    HAS_SKLEARN = True
+except Exception:
+    HAS_SKLEARN = False
+
+# Use requests (more straightforward error handling than urllib)
+try:
+    import requests
+except Exception:
+    print("Please install the 'requests' package: pip install requests")
+    raise
+
+# -----------------------
+# Config: URLs / local paths
+# -----------------------
+OWID_URL = "https://covid.ourworldindata.org/data/owid-covid-data.csv"
+LOCAL_SAMPLE = os.path.join(os.getcwd(), "sample_covid_data.csv")   # will be created if missing
+CLEANED_OUTPUT = os.path.join(os.getcwd(), "cleaned_covid_data.csv")
+
+# -----------------------
+# Create a synthetic sample dataset (if needed)
+# -----------------------
+def create_sample_csv(path, days=120, seed=42):
+    """
+    Creates a synthetic but realistic-looking COVID CSV and saves to `path`.
+    """
+    np.random.seed(seed)
+    start_date = datetime(2021, 1, 1)
+    countries = ['CountryA', 'CountryB']
+
+    rows = []
+    for country in countries:
+        total_cases = 1000 if country == 'CountryA' else 5000
+        total_deaths = 50 if country == 'CountryA' else 200
+        vaccinated = 0.0 if country == 'CountryA' else 5.0
+        fully_vaccinated = 0.0 if country == 'CountryA' else 1.0
+
+        for i in range(days):
+            date = start_date + timedelta(days=i)
+            # wave-like pattern plus noise
+            new_cases = int(max(0, np.abs(120 * np.sin(i/18.0) + (30 if country=='CountryB' else 8) + np.random.normal(0,18))))
+            new_deaths = max(0, int(new_cases * (0.01 + (0.005 if country=='CountryB' else 0.002)) + np.random.normal(0,1)))
+            total_cases += new_cases
+            total_deaths += new_deaths
+            vaccinated = min(100.0, vaccinated + max(0, np.random.normal(0.25, 0.06)))
+            fully_vaccinated = min(100.0, fully_vaccinated + max(0, np.random.normal(0.18, 0.05)))
+            stringency_index = max(0, min(100, 60 + 18*np.sin(i/28.0) + np.random.normal(0,6)))
+
+            rows.append({
+                'date': date.strftime('%Y-%m-%d'),
+                'location': country,
+                'new_cases': new_cases,
+                'new_deaths': new_deaths,
+                'total_cases': total_cases,
+                'total_deaths': total_deaths,
+                'people_vaccinated_per_hundred': round(vaccinated, 2),
+                'people_fully_vaccinated_per_hundred': round(fully_vaccinated, 2),
+                'stringency_index': round(stringency_index, 2),
+                # a simple population number so per-million columns can be calculated
+                'population': 1_000_000 if country=='CountryA' else 5_000_000
+            })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False)
+    print(f"Created sample CSV at: {path}")
+    return df
+
+# -----------------------
+# Load dataset: try OWID, fallback to local sample (create if absent)
+# -----------------------
+def load_dataset(owid_url=OWID_URL, local_path=LOCAL_SAMPLE):
+    # Try download
+    try:
+        print("Attempting to download Our World in Data dataset...")
+        r = requests.get(owid_url, timeout=15)
+        r.raise_for_status()
+        # if successful, read directly from text
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text), parse_dates=['date'], low_memory=False)
+        print("Downloaded OWID dataset. Shape:", df.shape)
+        source = 'owid'
+        return df, source
+    except Exception as exc:
+        print("Could not download OWID dataset (network or other error):", repr(exc))
+        # fallback local
+        if not os.path.exists(local_path):
+            print(f"Local sample file not found at {local_path}. Creating a synthetic sample dataset now.")
+            create_sample_csv(local_path)
+        else:
+            print(f"Loading local sample dataset from {local_path}.")
+        df = pd.read_csv(local_path, parse_dates=['date'])
+        print("Loaded sample dataset. Shape:", df.shape)
+        source = 'sample'
+        return df, source
+
+# Run loader
+df, source = load_dataset()
+
+# -----------------------
+# Basic cleaning & preprocessing
+# -----------------------
+# Normalize column names
+df.columns = [c.strip() for c in df.columns]
+
+# Ensure 'date' is datetime
+if df['date'].dtype == object:
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+# Drop rows missing required values
+df = df.dropna(subset=['date', 'location'])
+
+# Convert numeric columns to numeric and fill NaNs with 0 for numeric fields
+for col in df.columns:
+    if col not in ['date', 'location'] and df[col].dtype == object:
+        # attempt numeric conversion
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+df[numeric_cols] = df[numeric_cols].fillna(0)
+
+# Add per-million columns if population exists
+if 'population' in df.columns and 'total_cases' in df.columns:
+    df['cases_per_million'] = (df['total_cases'] / df['population']) * 1e6
+    df['new_cases_per_million'] = (df['new_cases'] / df['population']) * 1e6
+
+# Save cleaned data
+df.to_csv(CLEANED_OUTPUT, index=False)
+print(f"Saved cleaned dataset to: {CLEANED_OUTPUT}")
+
+# -----------------------
+# Small exploratory plots (should run without error)
+# -----------------------
+def plot_new_cases_with_rolling(location, window=7):
+    d = df[df['location'] == location].sort_values('date').copy()
+    if d.empty:
+        print(f"No data for location: {location}")
+        return
+    if 'new_cases' not in d.columns:
+        print("No 'new_cases' column available.")
+        return
+    d['new_cases_7d'] = d['new_cases'].rolling(window, min_periods=1).mean()
+    plt.figure(figsize=(12,5))
+    plt.plot(d['date'], d['new_cases'], label='Daily new cases', alpha=0.35)
+    plt.plot(d['date'], d['new_cases_7d'], label=f'{window}-day rolling avg', linewidth=2)
+    plt.title(f"New COVID-19 cases in {location}")
+    plt.xlabel("Date")
+    plt.ylabel("New cases")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# Pick two example locations (if available)
+locations = df['location'].unique().tolist()
+if len(locations) >= 2:
+    loc1, loc2 = locations[0], locations[1]
+else:
+    loc1 = locations[0]
+    loc2 = locations[0]
+
+print("Example plots for:", loc1, "and", loc2)
+plot_new_cases_with_rolling(loc1)
+plot_new_cases_with_rolling(loc2)
+
+# -----------------------
+# Optional: simple vaccination vs cases correlation & regression (if sklearn installed & vacc column present)
+# -----------------------
+def vacc_vs_cases_regression(location):
+    if not HAS_SKLEARN:
+        print("scikit-learn not installed; skipping regression step. Install with: pip install scikit-learn")
+        return
+    d = df[df['location'] == location].copy()
+    # pick vaccination column if exists
+    vacc_col = None
+    for candidate in ['people_fully_vaccinated_per_hundred', 'people_vaccinated_per_hundred']:
+        if candidate in d.columns:
+            vacc_col = candidate
+            break
+    if vacc_col is None:
+        print("No vaccination-per-hundred columns available for regression.")
+        return
+    target_col = 'new_cases_per_million' if 'new_cases_per_million' in d.columns else 'new_cases'
+    d = d[[vacc_col, target_col]].dropna()
+    if len(d) < 10:
+        print("Not enough data points for regression.")
+        return
+    X = d[[vacc_col]].values
+    y = d[target_col].values
+    model = LinearRegression().fit(X, y)
+    preds = model.predict(X)
+    r2 = r2_score(y, preds)
+    print(f"Linear regression ({location}): y ~ {vacc_col}; R^2 = {r2:.3f}")
+    plt.figure(figsize=(8,5))
+    plt.scatter(d[vacc_col], d[target_col], alpha=0.5)
+    xs = np.linspace(d[vacc_col].min(), d[vacc_col].max(), 100).reshape(-1,1)
+    plt.plot(xs, model.predict(xs), linewidth=2)
+    plt.xlabel(vacc_col)
+    plt.ylabel(target_col)
+    plt.title(f"{location}: {target_col} vs {vacc_col} (R^2={r2:.3f})")
+    plt.tight_layout()
+    plt.show()
+
+vacc_vs_cases_regression(loc1)
+
+# -----------------------
+# Final notes printed for the user
+# -----------------------
+print("\nDone. Summary:")
+print(f"- Data source used: {source}")
+print(f"- Cleaned CSV: {CLEANED_OUTPUT}")
+print(f"- Local sample CSV path: {LOCAL_SAMPLE} (created if download was not possible)")
+print("\nIf you still see network errors: your machine may be offline or behind a proxy/firewall. "
+      "If you want to use the OWID dataset but cannot fetch it from this machine, download the CSV manually from "
+      "https://covid.ourworldindata.org/data/owid-covid-data.csv and place it in the same folder as this notebook "
+      "named 'sample_covid_data.csv', then re-run the notebook.")
